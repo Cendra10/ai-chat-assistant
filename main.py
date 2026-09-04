@@ -1,11 +1,9 @@
-from fastapi import (FastAPI,
-                     HTTPException)
-import json
+from fastapi import FastAPI
 import os
 from dotenv import load_dotenv 
-from pydantic import BaseModel
+from schemas import (ChatRequest, ChatResponse, ChatAnalysis)
+from tools import get_current_time, tools
 from openai import OpenAI
-from datetime import datetime
 
 load_dotenv()
 
@@ -19,12 +17,6 @@ history = [
     {"role": "system", "content": "Kamu adalah asisten yang ramah dan menjawab singkat dalam Bahasa Indonesia."}
 ]
 
-class ChatRequest(BaseModel):
-    message: str
-
-class ChatResponse(BaseModel):
-    reply: str    
-
 @app.post("/chat/", response_model=ChatResponse)
 def chat(request: ChatRequest):
     global history
@@ -33,52 +25,64 @@ def chat(request: ChatRequest):
     result = client.chat.completions.create(
         model="openai/gpt-oss-20b",
             messages=history,
-            tools=tools
-            )
-    
-    message = result.choices[0].message
-    if message.tool_calls:
-        function_name = message.tool_calls[0].function.name
-        print(function_name)
+            tools=tools,
+            stream=True
+    )
 
+    reply_text = ""
+    tool_call_id = None
+    function_name = ""
+    function_args = ""
+
+    for chunk in result:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            reply_text += delta.content
+        if delta.tool_calls:
+            tc = delta.tool_calls[0]
+            if tc.id:
+                tool_call_id = tc.id
+            if tc.function.name:
+                function_name += tc.function.name
+            if tc.function.arguments:
+                function_args += tc.function.arguments
+    if function_name:
         if function_name == "get_current_time":
             tool_result = get_current_time()
 
         history.append({
+            "role": "assistant",
+            "tool_calls":[{
+                "id": tool_call_id,
+                "type": "function",
+                "function": {"name": function_name, "arguments": function_args}
+            }]
+        })
+
+        history.append({
             "role": "tool",
-            "tool_call_id": message.tool_calls[0].id,
+            "tool_call_id": tool_call_id,
             "name": function_name,
             "content": tool_result
-            })
-        
-        result = client.chat.completions.create(
+        })
+
+        result2 = client.chat.completions.create(
             model="openai/gpt-oss-20b",
             messages=history,
             tools=tools
-            )
-        reply_text = result.choices[0].message.content
+        )
+        reply_text = result2.choices[0].message.content
         history.append({"role": "assistant", "content": reply_text})
         return ChatResponse(reply=reply_text)
     else:
-        reply_text = message.content
         history.append({"role": "assistant", "content": reply_text})
         return ChatResponse(reply=reply_text)
 
-
-def get_current_time():
-    return datetime.now().strftime("%H:%M:%S")
-
-tools = [
-    {
-        "type": "function",
-        "function":{
-            "name":"get_current_time",
-            "description": "Mengambil waktu saat ini dalam format HH:MM:SS",
-            "parameters":{
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
-    }
-]
+@app.post("/analyze/", response_model=ChatAnalysis)
+def analyze(request: ChatRequest):
+    result = client.chat.completions.parse(
+        model="openai/gpt-oss-20b",
+        messages=[{"role": "user", "content": request.message}],
+        response_format=ChatAnalysis
+    )
+    return result.choices[0].message.parsed
